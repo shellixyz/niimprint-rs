@@ -1,16 +1,15 @@
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::mem::size_of;
 use std::thread;
 use std::time::Duration;
 
 use image::{DynamicImage, GrayImage, Luma, imageops};
+#[cfg(target_os = "linux")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::packet::{NiimbotPacket, PacketError};
 
 const BLUETOOTH_RFCOMM_CHANNEL: u8 = 1;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const BLUETOOTH_RFCOMM_PROTOCOL: i32 = 3;
 const PACKET_READ_SIZE: usize = 1024;
 const TRANSCEIVE_ATTEMPTS: usize = 6;
 const TRANSCEIVE_DELAY: Duration = Duration::from_millis(100);
@@ -96,95 +95,56 @@ impl Transport for SerialTransport {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 pub struct BluetoothTransport {
-    fd: i32,
+    runtime: tokio::runtime::Runtime,
+    stream: bluer::rfcomm::Stream,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 impl BluetoothTransport {
     /// Opens an RFCOMM Bluetooth connection to the printer.
     ///
     /// # Errors
     ///
-    /// Returns [`PrinterError`] when the address is invalid, the socket cannot
-    /// be created, or the printer cannot be reached.
+    /// Returns [`PrinterError`] when the address is invalid, the Tokio runtime
+    /// cannot be created, or the printer cannot be reached over RFCOMM.
     pub fn new(address: &str) -> Result<Self, PrinterError> {
-        let mut addr = parse_bluetooth_address(address)?;
-        addr.reverse();
+        let address = address
+            .parse::<bluer::Address>()
+            .map_err(|_| PrinterError::InvalidBluetoothAddress(address.to_owned()))?;
+        let runtime = tokio::runtime::Runtime::new().map_err(PrinterError::Io)?;
+        let socket_addr = bluer::rfcomm::SocketAddr::new(address, BLUETOOTH_RFCOMM_CHANNEL);
+        let stream = runtime
+            .block_on(bluer::rfcomm::Stream::connect(socket_addr))
+            .map_err(PrinterError::Io)?;
 
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_BLUETOOTH,
-                libc::SOCK_STREAM,
-                BLUETOOTH_RFCOMM_PROTOCOL,
-            )
-        };
-        if fd < 0 {
-            return Err(PrinterError::Io(io::Error::last_os_error()));
-        }
-
-        let sockaddr = SockAddrRc {
-            family: libc::sa_family_t::try_from(libc::AF_BLUETOOTH)
-                .map_err(|_| PrinterError::MalformedResponse("bluetooth family out of range"))?,
-            bdaddr: addr,
-            channel: BLUETOOTH_RFCOMM_CHANNEL,
-        };
-        let sockaddr_len = libc::socklen_t::try_from(size_of::<SockAddrRc>())
-            .map_err(|_| PrinterError::MalformedResponse("bluetooth sockaddr too large"))?;
-
-        let connect_result = unsafe {
-            libc::connect(
-                fd,
-                (&raw const sockaddr).cast::<libc::sockaddr>(),
-                sockaddr_len,
-            )
-        };
-        if connect_result != 0 {
-            let err = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(PrinterError::Io(err));
-        }
-
-        Ok(Self { fd })
+        Ok(Self { runtime, stream })
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-impl Drop for BluetoothTransport {
-    fn drop(&mut self) {
-        unsafe {
-            libc::shutdown(self.fd, libc::SHUT_RDWR);
-            libc::close(self.fd);
-        }
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 impl Transport for BluetoothTransport {
     fn read(&mut self, length: usize) -> io::Result<Vec<u8>> {
         let mut buf = vec![0_u8; length];
-        let read = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if read < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        buf.truncate(read.cast_unsigned());
+        let runtime = &self.runtime;
+        let stream = &mut self.stream;
+        let read = runtime.block_on(async { stream.read(&mut buf).await })?;
+        buf.truncate(read);
         Ok(buf)
     }
 
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        let written = unsafe { libc::write(self.fd, data.as_ptr().cast(), data.len()) };
-        if written < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(written.cast_unsigned())
+        let runtime = &self.runtime;
+        let stream = &mut self.stream;
+        runtime.block_on(async { stream.write(data).await })
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(target_os = "linux"))]
 pub struct BluetoothTransport;
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(target_os = "linux"))]
 impl BluetoothTransport {
     pub fn new(_address: &str) -> Result<Self, PrinterError> {
         Err(PrinterError::UnsupportedBluetoothPlatform)
@@ -680,32 +640,6 @@ fn hex_lower(data: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn parse_bluetooth_address(address: &str) -> Result<[u8; 6], PrinterError> {
-    let parts = address.split(':').collect::<Vec<_>>();
-    if parts.len() != 6 {
-        return Err(PrinterError::InvalidBluetoothAddress(address.to_owned()));
-    }
-
-    let mut bytes = [0_u8; 6];
-    for (idx, part) in parts.iter().enumerate() {
-        if part.len() != 2 {
-            return Err(PrinterError::InvalidBluetoothAddress(address.to_owned()));
-        }
-        bytes[idx] = u8::from_str_radix(part, 16)
-            .map_err(|_| PrinterError::InvalidBluetoothAddress(address.to_owned()))?;
-    }
-    Ok(bytes)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[repr(C)]
-struct SockAddrRc {
-    family: libc::sa_family_t,
-    bdaddr: [u8; 6],
-    channel: u8,
 }
 
 #[derive(Debug)]
