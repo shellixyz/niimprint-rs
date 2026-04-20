@@ -17,18 +17,27 @@ impl NiimbotPacket {
         }
     }
 
+    #[must_use]
     pub fn packet_type(&self) -> u8 {
         self.packet_type
     }
 
+    #[must_use]
     pub fn data(&self) -> &[u8] {
         &self.data
     }
 
+    #[must_use]
     pub fn into_data(self) -> Vec<u8> {
         self.data
     }
 
+    /// Parses a protocol packet from its raw wire representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PacketError`] when the packet header, footer, checksum, or
+    /// declared payload length does not match the provided bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PacketError> {
         if bytes.len() < 7 {
             return Err(PacketError::TooShort(bytes.len()));
@@ -63,11 +72,19 @@ impl NiimbotPacket {
         Ok(Self::new(packet_type, data.to_vec()))
     }
 
+    /// Serializes this packet into the wire format expected by the printer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the payload is larger than the protocol's one-byte length
+    /// field can encode.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
+        let data_len = u8::try_from(self.data.len()).expect("packet data exceeds protocol limit");
         let mut out = Vec::with_capacity(self.data.len() + 7);
         out.extend_from_slice(&PACKET_HEADER);
         out.push(self.packet_type);
-        out.push(self.data.len() as u8);
+        out.push(data_len);
         out.extend_from_slice(&self.data);
         out.push(checksum(self.packet_type, &self.data));
         out.extend_from_slice(&PACKET_FOOTER);
@@ -85,7 +102,8 @@ impl fmt::Debug for NiimbotPacket {
 }
 
 fn checksum(packet_type: u8, data: &[u8]) -> u8 {
-    let mut checksum = packet_type ^ (data.len() as u8);
+    let data_len = u8::try_from(data.len()).expect("packet data exceeds protocol limit");
+    let mut checksum = packet_type ^ data_len;
     for byte in data {
         checksum ^= byte;
     }

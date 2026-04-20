@@ -17,7 +17,18 @@ const TRANSCEIVE_DELAY: Duration = Duration::from_millis(100);
 const END_PRINT_SETTLE_DELAY: Duration = Duration::from_millis(300);
 
 pub trait Transport {
+    /// Reads up to `length` bytes from the device transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the underlying transport cannot be read.
     fn read(&mut self, length: usize) -> io::Result<Vec<u8>>;
+
+    /// Writes raw protocol bytes to the device transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the underlying transport cannot be written.
     fn write(&mut self, data: &[u8]) -> io::Result<usize>;
 }
 
@@ -36,6 +47,14 @@ pub struct SerialTransport {
 }
 
 impl SerialTransport {
+    /// Opens a serial connection to the printer.
+    ///
+    /// Passing `"auto"` will attempt to discover a single attached serial port.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when port detection fails or the selected port
+    /// cannot be opened.
     pub fn new(port: impl AsRef<str>) -> Result<Self, PrinterError> {
         let port = if port.as_ref() == "auto" {
             Self::detect_port()?
@@ -84,6 +103,12 @@ pub struct BluetoothTransport {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 impl BluetoothTransport {
+    /// Opens an RFCOMM Bluetooth connection to the printer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the address is invalid, the socket cannot
+    /// be created, or the printer cannot be reached.
     pub fn new(address: &str) -> Result<Self, PrinterError> {
         let mut addr = parse_bluetooth_address(address)?;
         addr.reverse();
@@ -100,16 +125,19 @@ impl BluetoothTransport {
         }
 
         let sockaddr = SockAddrRc {
-            rc_family: libc::AF_BLUETOOTH as libc::sa_family_t,
-            rc_bdaddr: addr,
-            rc_channel: BLUETOOTH_RFCOMM_CHANNEL,
+            family: libc::sa_family_t::try_from(libc::AF_BLUETOOTH)
+                .map_err(|_| PrinterError::MalformedResponse("bluetooth family out of range"))?,
+            bdaddr: addr,
+            channel: BLUETOOTH_RFCOMM_CHANNEL,
         };
+        let sockaddr_len = libc::socklen_t::try_from(size_of::<SockAddrRc>())
+            .map_err(|_| PrinterError::MalformedResponse("bluetooth sockaddr too large"))?;
 
         let connect_result = unsafe {
             libc::connect(
                 fd,
-                (&sockaddr as *const SockAddrRc).cast::<libc::sockaddr>(),
-                size_of::<SockAddrRc>() as libc::socklen_t,
+                (&raw const sockaddr).cast::<libc::sockaddr>(),
+                sockaddr_len,
             )
         };
         if connect_result != 0 {
@@ -140,7 +168,7 @@ impl Transport for BluetoothTransport {
         if read < 0 {
             return Err(io::Error::last_os_error());
         }
-        buf.truncate(read as usize);
+        buf.truncate(read.cast_unsigned());
         Ok(buf)
     }
 
@@ -149,7 +177,7 @@ impl Transport for BluetoothTransport {
         if written < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(written as usize)
+        Ok(written.cast_unsigned())
     }
 }
 
@@ -245,12 +273,23 @@ impl<T: Transport> PrinterClient<T> {
         &mut self.transport
     }
 
+    /// Sends the image to the printer using the requested density.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the image dimensions exceed the protocol
+    /// limits, command exchange fails, or the transport reports an I/O error.
     pub fn print_image(&mut self, image: &DynamicImage, density: u8) -> Result<(), PrinterError> {
+        let image_height = u16::try_from(image.height())
+            .map_err(|_| PrinterError::ImageTooLarge("image height exceeds printer limits"))?;
+        let image_width = u16::try_from(image.width())
+            .map_err(|_| PrinterError::ImageTooLarge("image width exceeds printer limits"))?;
+
         self.set_label_density(density)?;
         self.set_label_type(1)?;
         self.start_print()?;
         self.start_page_print()?;
-        self.set_dimension(image.height() as u16, image.width() as u16)?;
+        self.set_dimension(image_height, image_width)?;
         for packet in self.encode_image(image)? {
             self.send(&packet)?;
         }
@@ -262,10 +301,17 @@ impl<T: Transport> PrinterClient<T> {
         Ok(())
     }
 
+    /// Converts an image into the line packets expected by the printer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the image width or row index exceeds the
+    /// packet format's numeric limits.
     pub fn encode_image(&self, image: &DynamicImage) -> Result<Vec<NiimbotPacket>, PrinterError> {
         let mut img = grayscale_to_binary(image);
         imageops::invert(&mut img);
-        let width = img.width() as usize;
+        let width = usize::try_from(img.width())
+            .map_err(|_| PrinterError::ImageTooLarge("image width exceeds platform limits"))?;
         let height = img.height();
         let bytes_per_row = width.div_ceil(8);
 
@@ -273,7 +319,10 @@ impl<T: Transport> PrinterClient<T> {
             .map(|y| {
                 let mut line_data = vec![0_u8; bytes_per_row];
                 for x in 0..width {
-                    let pixel = img.get_pixel(x as u32, y)[0];
+                    let x_u32 = u32::try_from(x).map_err(|_| {
+                        PrinterError::ImageTooLarge("image width exceeds u32 coordinates")
+                    })?;
+                    let pixel = img.get_pixel(x_u32, y)[0];
                     if pixel != 0 {
                         let byte_index = x / 8;
                         let bit_index = 7 - (x % 8);
@@ -282,26 +331,38 @@ impl<T: Transport> PrinterClient<T> {
                 }
 
                 let mut payload = Vec::with_capacity(7 + line_data.len());
-                payload.extend_from_slice(&(y as u16).to_be_bytes());
+                payload.extend_from_slice(
+                    &u16::try_from(y)
+                        .map_err(|_| PrinterError::ImageTooLarge("image height exceeds u16"))?
+                        .to_be_bytes(),
+                );
                 payload.extend_from_slice(&[0, 0, 0, 1]);
                 payload.extend_from_slice(&line_data);
-                NiimbotPacket::new(0x85, payload)
+                Ok(NiimbotPacket::new(0x85, payload))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, PrinterError>>()?;
 
         Ok(packets)
     }
 
+    /// Reads a printer information field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the printer times out, returns malformed
+    /// data, or the transport fails.
     pub fn get_info(&mut self, key: InfoKey) -> Result<Option<InfoValue>, PrinterError> {
-        let response = match self.transceive(RequestCode::GetInfo, &[key as u8], key as u8)? {
-            Some(packet) => packet,
-            None => return Ok(None),
+        let Some(response) = self.transceive(RequestCode::GetInfo, &[key as u8], key as u8)? else {
+            return Ok(None);
         };
 
         let value = match key {
             InfoKey::DeviceSerial => InfoValue::DeviceSerial(hex_lower(response.data())),
             InfoKey::SoftVersion | InfoKey::HardVersion => {
-                InfoValue::Version(packet_data_to_u32(response.data()) as f32 / 100.0)
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    InfoValue::Version(packet_data_to_u32(response.data()) as f32 / 100.0)
+                }
             }
             _ => InfoValue::Integer(packet_data_to_u32(response.data())),
         };
@@ -309,10 +370,15 @@ impl<T: Transport> PrinterClient<T> {
         Ok(Some(value))
     }
 
+    /// Reads RFID metadata from the loaded label.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the printer response is malformed, the
+    /// transport fails, or the request times out.
     pub fn get_rfid(&mut self) -> Result<Option<RfidInfo>, PrinterError> {
-        let packet = match self.transceive(RequestCode::GetRfid, &[0x01], 1)? {
-            Some(packet) => packet,
-            None => return Ok(None),
+        let Some(packet) = self.transceive(RequestCode::GetRfid, &[0x01], 1)? else {
+            return Ok(None);
         };
         let data = packet.data();
         if data.is_empty() {
@@ -348,6 +414,12 @@ impl<T: Transport> PrinterClient<T> {
         }))
     }
 
+    /// Reads the current heartbeat payload from the printer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the request times out or the transport
+    /// exchange fails.
     pub fn heartbeat(&mut self) -> Result<HeartbeatStatus, PrinterError> {
         let packet = self
             .transceive(RequestCode::Heartbeat, &[0x01], 1)?
@@ -388,6 +460,12 @@ impl<T: Transport> PrinterClient<T> {
         Ok(status)
     }
 
+    /// Updates the label type configured on the printer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the provided label type is invalid, the
+    /// printer times out, or the transport exchange fails.
     pub fn set_label_type(&mut self, value: u8) -> Result<bool, PrinterError> {
         if !(1..=3).contains(&value) {
             return Err(PrinterError::InvalidLabelType(value));
@@ -395,6 +473,12 @@ impl<T: Transport> PrinterClient<T> {
         self.bool_command(RequestCode::SetLabelType, &[value], 16)
     }
 
+    /// Updates the print density configured on the printer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the density is outside the supported
+    /// range, the printer times out, or the transport exchange fails.
     pub fn set_label_density(&mut self, value: u8) -> Result<bool, PrinterError> {
         if !(1..=5).contains(&value) {
             return Err(PrinterError::InvalidDensity(value));
@@ -402,26 +486,62 @@ impl<T: Transport> PrinterClient<T> {
         self.bool_command(RequestCode::SetLabelDensity, &[value], 16)
     }
 
+    /// Starts a print job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the printer does not acknowledge the
+    /// command or the transport exchange fails.
     pub fn start_print(&mut self) -> Result<bool, PrinterError> {
         self.bool_command(RequestCode::StartPrint, &[0x01], 1)
     }
 
+    /// Finalizes a print job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the printer does not acknowledge the
+    /// command or the transport exchange fails.
     pub fn end_print(&mut self) -> Result<bool, PrinterError> {
         self.bool_command(RequestCode::EndPrint, &[0x01], 1)
     }
 
+    /// Starts a page within the current print job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the printer does not acknowledge the
+    /// command or the transport exchange fails.
     pub fn start_page_print(&mut self) -> Result<bool, PrinterError> {
         self.bool_command(RequestCode::StartPagePrint, &[0x01], 1)
     }
 
+    /// Finishes the current page within the print job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the printer does not acknowledge the
+    /// command or the transport exchange fails.
     pub fn end_page_print(&mut self) -> Result<bool, PrinterError> {
         self.bool_command(RequestCode::EndPagePrint, &[0x01], 1)
     }
 
+    /// Allows the printer to clear buffered page data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the printer does not acknowledge the
+    /// command or the transport exchange fails.
     pub fn allow_print_clear(&mut self) -> Result<bool, PrinterError> {
         self.bool_command(RequestCode::AllowPrintClear, &[0x01], 16)
     }
 
+    /// Sets the label dimensions used for the current job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the printer does not acknowledge the
+    /// command or the transport exchange fails.
     pub fn set_dimension(&mut self, width: u16, height: u16) -> Result<bool, PrinterError> {
         let mut payload = Vec::with_capacity(4);
         payload.extend_from_slice(&width.to_be_bytes());
@@ -429,10 +549,22 @@ impl<T: Transport> PrinterClient<T> {
         self.bool_command(RequestCode::SetDimension, &payload, 1)
     }
 
+    /// Sets how many copies the printer should produce.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the printer does not acknowledge the
+    /// command or the transport exchange fails.
     pub fn set_quantity(&mut self, quantity: u16) -> Result<bool, PrinterError> {
         self.bool_command(RequestCode::SetQuantity, &quantity.to_be_bytes(), 1)
     }
 
+    /// Reads the current status of the printer's active job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the printer times out, returns malformed
+    /// data, or the transport exchange fails.
     pub fn get_print_status(&mut self) -> Result<PrintStatus, PrinterError> {
         let packet = self
             .transceive(RequestCode::GetPrintStatus, &[0x01], 16)?
@@ -518,7 +650,7 @@ fn grayscale_to_binary(image: &DynamicImage) -> GrayImage {
 
 fn packet_data_to_u32(data: &[u8]) -> u32 {
     data.iter()
-        .fold(0_u32, |acc, byte| (acc << 8) | (*byte as u32))
+        .fold(0_u32, |acc, byte| (acc << 8) | u32::from(*byte))
 }
 
 fn read_len_prefixed_string(
@@ -571,9 +703,9 @@ fn parse_bluetooth_address(address: &str) -> Result<[u8; 6], PrinterError> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[repr(C)]
 struct SockAddrRc {
-    rc_family: libc::sa_family_t,
-    rc_bdaddr: [u8; 6],
-    rc_channel: u8,
+    family: libc::sa_family_t,
+    bdaddr: [u8; 6],
+    channel: u8,
 }
 
 #[derive(Debug)]
@@ -590,6 +722,7 @@ pub enum PrinterError {
     NoSerialPortsDetected,
     TooManySerialPorts(Vec<String>),
     MalformedResponse(&'static str),
+    ImageTooLarge(&'static str),
     Timeout,
     DeviceError,
     UnsupportedResponse,
@@ -621,6 +754,7 @@ impl fmt::Display for PrinterError {
                 write!(f, "multiple serial ports detected: {}", ports.join(", "))
             }
             Self::MalformedResponse(message) => write!(f, "malformed device response: {message}"),
+            Self::ImageTooLarge(message) => write!(f, "{message}"),
             Self::Timeout => write!(f, "timed out waiting for printer response"),
             Self::DeviceError => write!(f, "printer reported a device error"),
             Self::UnsupportedResponse => write!(f, "printer returned an unsupported response"),
@@ -653,7 +787,7 @@ mod tests {
             if x < 4 { Luma([255]) } else { Luma([0]) }
         }));
 
-        let transport = FakeTransport::default();
+        let transport = FakeTransport;
         let client = PrinterClient::new(transport);
         let packets = client.encode_image(&image).unwrap();
 

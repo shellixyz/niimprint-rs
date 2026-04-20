@@ -1,3 +1,5 @@
+#![warn(clippy::pedantic)]
+
 mod packet;
 mod printer;
 
