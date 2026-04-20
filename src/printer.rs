@@ -21,6 +21,16 @@ pub trait Transport {
     fn write(&mut self, data: &[u8]) -> io::Result<usize>;
 }
 
+impl<T: Transport + ?Sized> Transport for Box<T> {
+    fn read(&mut self, length: usize) -> io::Result<Vec<u8>> {
+        (**self).read(length)
+    }
+
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        (**self).write(data)
+    }
+}
+
 pub struct SerialTransport {
     inner: Box<dyn serialport::SerialPort>,
 }
@@ -575,6 +585,7 @@ pub enum PrinterError {
     InvalidDensity(u8),
     InvalidLabelType(u8),
     InvalidBluetoothAddress(String),
+    MissingBluetoothAddress,
     UnsupportedBluetoothPlatform,
     NoSerialPortsDetected,
     TooManySerialPorts(Vec<String>),
@@ -595,6 +606,9 @@ impl fmt::Display for PrinterError {
             Self::InvalidLabelType(value) => write!(f, "invalid label type: {value}"),
             Self::InvalidBluetoothAddress(value) => {
                 write!(f, "invalid bluetooth MAC address: {value}")
+            }
+            Self::MissingBluetoothAddress => {
+                write!(f, "bluetooth connection requires --addr with a MAC address")
             }
             Self::UnsupportedBluetoothPlatform => {
                 write!(
