@@ -244,18 +244,24 @@ impl<T: Transport> PrinterClient<T> {
             .map_err(|_| PrinterError::ImageTooLarge("image height exceeds printer limits"))?;
         let image_width = u16::try_from(image.width())
             .map_err(|_| PrinterError::ImageTooLarge("image width exceeds printer limits"))?;
+        let label_type = self.get_rfid()?.map_or(1, |rfid_info| rfid_info.label_type);
 
-        self.set_label_density(density)?;
-        self.set_label_type(1)?;
-        self.start_print()?;
-        self.start_page_print()?;
-        self.set_dimension(image_height, image_width)?;
+        with_command_context("set label density", self.set_label_density(density))?;
+        with_command_context("set label type", self.set_label_type(label_type))?;
+        with_command_context("start print", self.start_print())?;
+        with_command_context("allow print clear", self.allow_print_clear())?;
+        with_command_context("start page print", self.start_page_print())?;
+        with_command_context(
+            "set dimension",
+            self.set_dimension(image_height, image_width),
+        )?;
+        with_command_context("set quantity", self.set_quantity(1))?;
         for packet in self.encode_image(image)? {
             self.send(&packet)?;
         }
-        self.end_page_print()?;
+        with_command_context("end page print", self.end_page_print())?;
         thread::sleep(END_PRINT_SETTLE_DELAY);
-        while !self.end_print()? {
+        while !with_command_context("end print", self.end_print())? {
             thread::sleep(TRANSCEIVE_DELAY);
         }
         Ok(())
@@ -427,7 +433,7 @@ impl<T: Transport> PrinterClient<T> {
     /// Returns [`PrinterError`] when the provided label type is invalid, the
     /// printer times out, or the transport exchange fails.
     pub fn set_label_type(&mut self, value: u8) -> Result<bool, PrinterError> {
-        if !(1..=3).contains(&value) {
+        if !matches!(value, 1 | 2 | 3 | 4 | 5 | 6 | 10 | 11) {
             return Err(PrinterError::InvalidLabelType(value));
         }
         self.bool_command(RequestCode::SetLabelType, &[value], 16)
@@ -587,7 +593,7 @@ impl<T: Transport> PrinterClient<T> {
         for _ in 0..TRANSCEIVE_ATTEMPTS {
             for packet in self.recv()? {
                 match packet.packet_type() {
-                    219 => return Err(PrinterError::DeviceError),
+                    219 => return Err(PrinterError::DeviceError(packet.data().to_vec())),
                     0 => return Err(PrinterError::UnsupportedResponse),
                     code if code == response_code => return Ok(Some(packet)),
                     _ => {}
@@ -642,6 +648,16 @@ fn hex_lower(data: &[u8]) -> String {
     out
 }
 
+fn with_command_context<T>(
+    command: &'static str,
+    result: Result<T, PrinterError>,
+) -> Result<T, PrinterError> {
+    result.map_err(|source| PrinterError::CommandFailed {
+        command,
+        source: Box::new(source),
+    })
+}
+
 #[derive(Debug)]
 pub enum PrinterError {
     Io(io::Error),
@@ -658,8 +674,12 @@ pub enum PrinterError {
     MalformedResponse(&'static str),
     ImageTooLarge(&'static str),
     Timeout,
-    DeviceError,
+    DeviceError(Vec<u8>),
     UnsupportedResponse,
+    CommandFailed {
+        command: &'static str,
+        source: Box<PrinterError>,
+    },
 }
 
 impl fmt::Display for PrinterError {
@@ -690,9 +710,36 @@ impl fmt::Display for PrinterError {
             Self::MalformedResponse(message) => write!(f, "malformed device response: {message}"),
             Self::ImageTooLarge(message) => write!(f, "{message}"),
             Self::Timeout => write!(f, "timed out waiting for printer response"),
-            Self::DeviceError => write!(f, "printer reported a device error"),
+            Self::DeviceError(data) => write!(f, "printer reported {}", format_device_error(data)),
             Self::UnsupportedResponse => write!(f, "printer returned an unsupported response"),
+            Self::CommandFailed { command, source } => write!(f, "{command} failed: {source}"),
         }
+    }
+}
+
+fn format_device_error(data: &[u8]) -> String {
+    if let Some(code) = data.first() {
+        format!("a device error: code {code} ({})", device_error_name(*code))
+    } else {
+        "a device error without an error code".to_string()
+    }
+}
+
+fn device_error_name(code: u8) -> &'static str {
+    match code {
+        3 => "low battery",
+        7 => "overheat",
+        8 => "paper out",
+        9 => "printer busy",
+        10 => "no printer head",
+        12 => "printer head loose",
+        13 => "no ribbon",
+        25 => "rotation parameter exception",
+        29 => "RFID tag not written",
+        34 => "RFID writing not supported",
+        52 => "receive data timeout",
+        53 => "non-dedicated ribbon",
+        _ => "unknown",
     }
 }
 
