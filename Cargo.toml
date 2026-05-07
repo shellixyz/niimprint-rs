@@ -2,6 +2,13 @@
 name = "niimprint-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Rust client library for Niimbot label printers over USB or Bluetooth."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/shellixyz/niimprint-rs"
+homepage = "https://github.com/shellixyz/niimprint-rs"
+keywords = ["niimbot", "printer", "label", "bluetooth", "serial"]
+categories = ["command-line-utilities", "hardware-support"]
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
