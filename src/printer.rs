@@ -338,18 +338,9 @@ impl<T: Transport> PrinterClient<T> {
         self.transport.write(&init_packet)?;
         thread::sleep(Duration::from_millis(200));
 
-        let _ = self.send(&NiimbotPacket::new(
-            RequestCode::PrinterStatusData as u8,
-            vec![0x01],
-        ));
-        thread::sleep(Duration::from_millis(50));
-        let _ = self.send(&NiimbotPacket::new(RequestCode::GetInfo as u8, vec![0x08]));
-        thread::sleep(Duration::from_millis(50));
-        let _ = self.send(&NiimbotPacket::new(
-            RequestCode::Heartbeat as u8,
-            vec![0x04],
-        ));
-        thread::sleep(Duration::from_millis(50));
+        let _ = self.transceive(RequestCode::PrinterStatusData, &[0x01], 1);
+        let _ = self.transceive(RequestCode::GetInfo, &[0x08], 1);
+        let _ = self.transceive(RequestCode::Heartbeat, &[0x04], 1);
 
         Ok(())
     }
