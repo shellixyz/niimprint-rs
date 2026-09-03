@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+
+# Exit immediately if a command exits with a non-zero status.
+set -e
+
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+    STASH_OUT=$(git stash push --keep-index --include-untracked -m "pre-commit-stash")
+    if [ "$STASH_OUT" != "No local changes to save" ]; then
+        trap "echo 'Restoring stashed changes...'; git stash pop --quiet" EXIT
+    fi
+else
+    echo "Initial commit, skipping stash."
+fi
+
+echo "Running: cargo fmt --all -- --check"
+if ! cargo fmt --all -- --check; then
+    echo "Error: cargo fmt found formatting issues. Run 'cargo fmt --all' to fix them."
+    exit 1
+fi
+
+echo "Running: cargo check --all-targets --all-features"
+if ! cargo check --all-targets --all-features; then
+    echo "Error: cargo check found issues. Please fix them before committing."
+    exit 1
+fi
+
+echo "Running: cargo clippy --all-targets --all-features -- -D warnings"
+if ! cargo clippy --all-targets --all-features -- -D warnings; then
+    echo "Error: cargo clippy found issues. Please fix them before committing."
+    exit 1
+fi
+
+echo "Running: cargo test --all-features"
+if ! cargo test --all-features; then
+    echo "Error: cargo test failed. Please fix failing tests before committing."
+    exit 1
+fi
+
+echo "All checks passed!"
+exit 0
