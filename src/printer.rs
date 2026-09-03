@@ -229,11 +229,11 @@ impl Transport for BluetoothTransport {
                         .await
                 })
                 .map_err(io::Error::other)?;
-
-            // Delay between chunks to prevent BLE buffer overflow on the printer
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            // NO SLEEP here! Just blast the chunks of the same packet!
         }
 
+        // Sleep AFTER the whole packet is sent!
+        std::thread::sleep(std::time::Duration::from_millis(15));
         Ok(data.len())
     }
 }
