@@ -358,7 +358,12 @@ impl<T: Transport> PrinterClient<T> {
     ///
     /// Returns [`PrinterError`] when the image dimensions exceed the protocol
     /// limits, command exchange fails, or the transport reports an I/O error.
-    pub fn print_image(&mut self, image: &DynamicImage, density: u8) -> Result<(), PrinterError> {
+    pub fn print_image(
+        &mut self,
+        image: &DynamicImage,
+        density: u8,
+        quantity: u16,
+    ) -> Result<(), PrinterError> {
         let image_height = u16::try_from(image.height())
             .map_err(|_| PrinterError::ImageTooLarge("image height exceeds printer limits"))?;
         let image_width = u16::try_from(image.width())
@@ -373,25 +378,39 @@ impl<T: Transport> PrinterClient<T> {
         with_command_context("set label type", self.set_label_type(label_type))?;
         with_command_context("start print", self.start_print())?;
 
-        with_command_context("start page print", self.start_page_print())?;
         with_command_context(
             "set dimension",
             self.set_dimension(image_height, image_width),
         )?;
-        for packet in self.encode_image(image)? {
-            self.send(&packet)?;
-        }
-        with_command_context("end page print", self.end_page_print())?;
+        with_command_context("set quantity", self.set_quantity(quantity))?;
 
-        // Wait for the printer to finish printing the page so it doesn't abort
+        let packets = self.encode_image(image)?;
+
+        for _ in 0..quantity {
+            with_command_context("start page print", self.start_page_print())?;
+            // Depending on printer model, dimension might need to be set per page or per job,
+            // but setting it per job is safer if we loop pages. Actually, let's keep it per page
+            // to match the original loop behavior safely.
+            with_command_context(
+                "set dimension",
+                self.set_dimension(image_height, image_width),
+            )?;
+
+            for packet in &packets {
+                self.send(packet)?;
+            }
+            with_command_context("end page print", self.end_page_print())?;
+        }
+
+        // Wait for the printer to finish printing the page(s) so it doesn't abort
         // the feed-out by receiving EndPrint too early.
         let start_wait = std::time::Instant::now();
         loop {
-            if start_wait.elapsed() > std::time::Duration::from_secs(10) {
+            if start_wait.elapsed() > std::time::Duration::from_secs(20) {
                 return Err(PrinterError::Timeout);
             }
             if let Ok(status) = self.get_print_status()
-                && status.page >= 1
+                && status.page >= quantity
             {
                 break;
             }

@@ -120,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let transport = create_transport(cli.conn, cli.addr)?;
     let mut printer = PrinterClient::new(transport);
-    printer.print_image(&image, density)?;
+    printer.print_image(&image, density, 1)?;
     Ok(())
 }
 
