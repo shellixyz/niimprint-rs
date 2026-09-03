@@ -229,10 +229,10 @@ impl Transport for BluetoothTransport {
                         .await
                 })
                 .map_err(io::Error::other)?;
-        }
 
-        // Pace per row (packet), not per chunk!
-        std::thread::sleep(std::time::Duration::from_millis(15));
+            // Delay between chunks to prevent BLE buffer overflow on the printer
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
 
         Ok(data.len())
     }
@@ -384,7 +384,6 @@ impl<T: Transport> PrinterClient<T> {
             "set dimension",
             self.set_dimension(image_height, image_width),
         )?;
-        with_command_context("set quantity", self.set_quantity(1))?;
         for packet in self.encode_image(image)? {
             self.send(&packet)?;
         }
@@ -427,7 +426,6 @@ impl<T: Transport> PrinterClient<T> {
         let packets = (0..height)
             .map(|y| {
                 let mut line_data = vec![0_u8; bytes_per_row];
-                let mut popcount = 0u16;
                 for x in 0..width {
                     let x_u32 = u32::try_from(x).map_err(|_| {
                         PrinterError::ImageTooLarge("image width exceeds u32 coordinates")
@@ -437,7 +435,6 @@ impl<T: Transport> PrinterClient<T> {
                         let byte_index = x / 8;
                         let bit_index = 7 - (x % 8);
                         line_data[byte_index] |= 1 << bit_index;
-                        popcount += 1;
                     }
                 }
 
@@ -449,9 +446,10 @@ impl<T: Transport> PrinterClient<T> {
                 );
 
                 // Header format: y(2 bytes, big-endian), 0, total(2 bytes, little-endian), run(1)
+                // Python niimprint sends (0, 0, 0) here: "It seems like you can always send zeros"
                 payload.push(0);
-                payload.push((popcount & 0xff) as u8);
-                payload.push((popcount >> 8) as u8);
+                payload.push(0);
+                payload.push(0);
                 payload.push(1);
 
                 payload.extend_from_slice(&line_data);
@@ -930,7 +928,7 @@ mod tests {
 
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].packet_type(), 0x85);
-        assert_eq!(packets[0].data()[..6], [0, 0, 0, 4, 0, 1]);
+        assert_eq!(packets[0].data()[..6], [0, 0, 0, 0, 0, 1]);
         assert_eq!(packets[0].data()[6], 0x0f);
     }
 
