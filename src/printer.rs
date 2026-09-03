@@ -7,7 +7,10 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use crate::packet::{NiimbotPacket, PacketError};
 use image::{DynamicImage, GrayImage, Luma, imageops};
+#[cfg(target_os = "linux")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+const BLUETOOTH_RFCOMM_CHANNEL: u8 = 1;
 const PACKET_READ_SIZE: usize = 1024;
 const TRANSCEIVE_ATTEMPTS: usize = 6;
 const TRANSCEIVE_DELAY: Duration = Duration::from_millis(100);
@@ -27,6 +30,11 @@ pub trait Transport {
     ///
     /// Returns an I/O error when the underlying transport cannot be written.
     fn write(&mut self, data: &[u8]) -> io::Result<usize>;
+
+    /// Indicates whether the transport requires a BLE-specific handshake.
+    fn requires_ble_handshake(&self) -> bool {
+        false
+    }
 }
 
 impl<T: Transport + ?Sized> Transport for Box<T> {
@@ -36,6 +44,10 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
 
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         (**self).write(data)
+    }
+
+    fn requires_ble_handshake(&self) -> bool {
+        (**self).requires_ble_handshake()
     }
 }
 
@@ -94,16 +106,26 @@ impl Transport for SerialTransport {
 }
 
 #[cfg(target_os = "linux")]
+enum BtConn {
+    Gatt {
+        characteristic: bluer::gatt::remote::Characteristic,
+        notify: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Vec<u8>> + Send>>,
+        read_buf: Vec<u8>,
+    },
+    Rfcomm {
+        stream: bluer::rfcomm::Stream,
+    },
+}
+
+#[cfg(target_os = "linux")]
 pub struct BluetoothTransport {
     runtime: tokio::runtime::Runtime,
-    characteristic: bluer::gatt::remote::Characteristic,
-    notify: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Vec<u8>> + Send>>,
-    read_buf: Vec<u8>,
+    conn: BtConn,
 }
 
 #[cfg(target_os = "linux")]
 impl BluetoothTransport {
-    /// Opens a BLE GATT Bluetooth connection to the printer.
+    /// Opens a BLE GATT Bluetooth connection to the printer, falling back to RFCOMM if GATT is not available.
     ///
     /// # Panics
     ///
@@ -114,17 +136,17 @@ impl BluetoothTransport {
     /// Returns [`PrinterError`] when the address is invalid, the Tokio runtime
     /// cannot be created, or the printer cannot be reached.
     pub fn new(address: &str) -> Result<Self, PrinterError> {
-        let address = address
+        let address_parsed = address
             .parse::<bluer::Address>()
             .map_err(|_| PrinterError::InvalidBluetoothAddress(address.to_owned()))?;
         let runtime = tokio::runtime::Runtime::new().map_err(PrinterError::Io)?;
 
         let mut attempt = 0;
-        let (characteristic, notify) = loop {
+        let gatt_res = loop {
             match runtime.block_on(async {
                 let session = bluer::Session::new().await.map_err(io::Error::other)?;
                 let adapter = session.default_adapter().await.map_err(io::Error::other)?;
-                let device = adapter.device(address).map_err(io::Error::other)?;
+                let device = adapter.device(address_parsed).map_err(io::Error::other)?;
                 if !device.is_connected().await.unwrap_or(false) {
                     device.connect().await.map_err(io::Error::other)?;
                 }
@@ -160,22 +182,37 @@ impl BluetoothTransport {
                     Box::pin(notify_stream);
                 Ok::<_, io::Error>((characteristic, notify))
             }) {
-                Ok(res) => break res,
+                Ok(res) => break Ok(res),
                 Err(err) => {
                     attempt += 1;
                     if attempt >= 5 {
-                        return Err(PrinterError::Io(err));
+                        break Err(PrinterError::Io(err));
                     }
                     thread::sleep(Duration::from_millis(500));
                 }
             }
         };
 
+        if let Ok((characteristic, notify)) = gatt_res {
+            return Ok(Self {
+                runtime,
+                conn: BtConn::Gatt {
+                    characteristic,
+                    notify,
+                    read_buf: Vec::new(),
+                },
+            });
+        }
+
+        // Fallback to RFCOMM
+        let socket_addr = bluer::rfcomm::SocketAddr::new(address_parsed, BLUETOOTH_RFCOMM_CHANNEL);
+        let stream = runtime
+            .block_on(bluer::rfcomm::Stream::connect(socket_addr))
+            .map_err(PrinterError::Io)?;
+
         Ok(Self {
             runtime,
-            characteristic,
-            notify,
-            read_buf: Vec::new(),
+            conn: BtConn::Rfcomm { stream },
         })
     }
 }
@@ -183,52 +220,70 @@ impl BluetoothTransport {
 #[cfg(target_os = "linux")]
 impl Transport for BluetoothTransport {
     fn read(&mut self, length: usize) -> io::Result<Vec<u8>> {
-        use tokio_stream::StreamExt;
-
-        if !self.read_buf.is_empty() {
-            let read_len = self.read_buf.len().min(length);
-            let result: Vec<u8> = self.read_buf.drain(..read_len).collect();
-            return Ok(result);
-        }
-
         let runtime = &self.runtime;
-        let notify = &mut self.notify;
-        let data = runtime
-            .block_on(async { notify.next().await })
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "GATT notification stream ended",
-                )
-            })?;
+        match &mut self.conn {
+            BtConn::Gatt {
+                notify, read_buf, ..
+            } => {
+                use tokio_stream::StreamExt;
 
-        if data.len() <= length {
-            Ok(data)
-        } else {
-            self.read_buf = data[length..].to_vec();
-            Ok(data[..length].to_vec())
+                if !read_buf.is_empty() {
+                    let read_len = read_buf.len().min(length);
+                    let result: Vec<u8> = read_buf.drain(..read_len).collect();
+                    return Ok(result);
+                }
+
+                let data = runtime
+                    .block_on(async { notify.next().await })
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "GATT notification stream ended",
+                        )
+                    })?;
+
+                if data.len() <= length {
+                    Ok(data)
+                } else {
+                    *read_buf = data[length..].to_vec();
+                    Ok(data[..length].to_vec())
+                }
+            }
+            BtConn::Rfcomm { stream } => {
+                let mut buf = vec![0_u8; length];
+                let read = runtime.block_on(async { stream.read(&mut buf).await })?;
+                buf.truncate(read);
+                Ok(buf)
+            }
         }
     }
 
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         let runtime = &self.runtime;
-        let characteristic = &self.characteristic;
+        match &mut self.conn {
+            BtConn::Gatt { characteristic, .. } => {
+                runtime
+                    .block_on(async {
+                        characteristic
+                            .write_ext(
+                                data,
+                                &CharacteristicWriteRequest {
+                                    op_type: WriteOp::Command,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                    })
+                    .map_err(io::Error::other)?;
 
-        runtime
-            .block_on(async {
-                characteristic
-                    .write_ext(
-                        data,
-                        &CharacteristicWriteRequest {
-                            op_type: WriteOp::Command,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-            })
-            .map_err(io::Error::other)?;
+                Ok(data.len())
+            }
+            BtConn::Rfcomm { stream } => runtime.block_on(async { stream.write(data).await }),
+        }
+    }
 
-        Ok(data.len())
+    fn requires_ble_handshake(&self) -> bool {
+        matches!(self.conn, BtConn::Gatt { .. })
     }
 }
 
@@ -370,7 +425,9 @@ impl<T: Transport> PrinterClient<T> {
             .map_err(|_| PrinterError::ImageTooLarge("image width exceeds printer limits"))?;
 
         // Initialize BLE connection (required for some devices like B1/D110 over BLE)
-        let _ = self.init_connection();
+        if self.transport.requires_ble_handshake() {
+            let _ = self.init_connection();
+        }
 
         let label_type = self.get_rfid()?.map_or(1, |rfid_info| rfid_info.label_type);
 
@@ -378,29 +435,19 @@ impl<T: Transport> PrinterClient<T> {
         with_command_context("set label type", self.set_label_type(label_type))?;
         with_command_context("start print", self.start_print())?;
 
+        let packets = self.encode_image(image)?;
+
+        with_command_context("start page print", self.start_page_print())?;
         with_command_context(
             "set dimension",
             self.set_dimension(image_height, image_width),
         )?;
         with_command_context("set quantity", self.set_quantity(quantity))?;
 
-        let packets = self.encode_image(image)?;
-
-        for _ in 0..quantity {
-            with_command_context("start page print", self.start_page_print())?;
-            // Depending on printer model, dimension might need to be set per page or per job,
-            // but setting it per job is safer if we loop pages. Actually, let's keep it per page
-            // to match the original loop behavior safely.
-            with_command_context(
-                "set dimension",
-                self.set_dimension(image_height, image_width),
-            )?;
-
-            for packet in &packets {
-                self.send(packet)?;
-            }
-            with_command_context("end page print", self.end_page_print())?;
+        for packet in &packets {
+            self.send(packet)?;
         }
+        with_command_context("end page print", self.end_page_print())?;
 
         // Wait for the printer to finish printing the page(s) so it doesn't abort
         // the feed-out by receiving EndPrint too early.
