@@ -214,26 +214,20 @@ impl Transport for BluetoothTransport {
         let runtime = &self.runtime;
         let characteristic = &self.characteristic;
 
-        let chunk_size = 20;
-        for chunk in data.chunks(chunk_size) {
-            runtime
-                .block_on(async {
-                    characteristic
-                        .write_ext(
-                            chunk,
-                            &CharacteristicWriteRequest {
-                                op_type: WriteOp::Command,
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                })
-                .map_err(io::Error::other)?;
-            // NO SLEEP here! Just blast the chunks of the same packet!
-        }
+        runtime
+            .block_on(async {
+                characteristic
+                    .write_ext(
+                        data,
+                        &CharacteristicWriteRequest {
+                            op_type: WriteOp::Command,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+            .map_err(io::Error::other)?;
 
-        // Sleep AFTER the whole packet is sent!
-        std::thread::sleep(std::time::Duration::from_millis(15));
         Ok(data.len())
     }
 }
