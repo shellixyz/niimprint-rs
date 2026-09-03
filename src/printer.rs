@@ -1,15 +1,13 @@
+use bluer::gatt::{WriteOp, remote::CharacteristicWriteRequest};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::thread;
 use std::time::Duration;
 
-use image::{DynamicImage, GrayImage, Luma, imageops};
 #[cfg(target_os = "linux")]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
 use crate::packet::{NiimbotPacket, PacketError};
+use image::{DynamicImage, GrayImage, Luma, imageops};
 
-const BLUETOOTH_RFCOMM_CHANNEL: u8 = 1;
 const PACKET_READ_SIZE: usize = 1024;
 const TRANSCEIVE_ATTEMPTS: usize = 6;
 const TRANSCEIVE_DELAY: Duration = Duration::from_millis(100);
@@ -98,46 +96,145 @@ impl Transport for SerialTransport {
 #[cfg(target_os = "linux")]
 pub struct BluetoothTransport {
     runtime: tokio::runtime::Runtime,
-    stream: bluer::rfcomm::Stream,
+    characteristic: bluer::gatt::remote::Characteristic,
+    notify: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Vec<u8>> + Send>>,
+    read_buf: Vec<u8>,
 }
 
 #[cfg(target_os = "linux")]
 impl BluetoothTransport {
-    /// Opens an RFCOMM Bluetooth connection to the printer.
+    /// Opens a BLE GATT Bluetooth connection to the printer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the hardcoded Bluetooth service UUIDs are invalid.
     ///
     /// # Errors
     ///
     /// Returns [`PrinterError`] when the address is invalid, the Tokio runtime
-    /// cannot be created, or the printer cannot be reached over RFCOMM.
+    /// cannot be created, or the printer cannot be reached.
     pub fn new(address: &str) -> Result<Self, PrinterError> {
         let address = address
             .parse::<bluer::Address>()
             .map_err(|_| PrinterError::InvalidBluetoothAddress(address.to_owned()))?;
         let runtime = tokio::runtime::Runtime::new().map_err(PrinterError::Io)?;
-        let socket_addr = bluer::rfcomm::SocketAddr::new(address, BLUETOOTH_RFCOMM_CHANNEL);
-        let stream = runtime
-            .block_on(bluer::rfcomm::Stream::connect(socket_addr))
-            .map_err(PrinterError::Io)?;
 
-        Ok(Self { runtime, stream })
+        let mut attempt = 0;
+        let (characteristic, notify) = loop {
+            match runtime.block_on(async {
+                let session = bluer::Session::new().await.map_err(io::Error::other)?;
+                let adapter = session.default_adapter().await.map_err(io::Error::other)?;
+                let device = adapter.device(address).map_err(io::Error::other)?;
+                if !device.is_connected().await.unwrap_or(false) {
+                    device.connect().await.map_err(io::Error::other)?;
+                }
+
+                let mut target_char = None;
+                for service in device.services().await.map_err(io::Error::other)? {
+                    if service.uuid().await.unwrap_or_default()
+                        == "e7810a71-73ae-499d-8c15-faa9aef0c3f2"
+                            .parse::<bluer::Uuid>()
+                            .unwrap()
+                    {
+                        for char in service.characteristics().await.map_err(io::Error::other)? {
+                            if char.uuid().await.unwrap_or_default()
+                                == "bef8d6c9-9c21-4c9e-b632-bd58c1009f9f"
+                                    .parse::<bluer::Uuid>()
+                                    .unwrap()
+                            {
+                                target_char = Some(char);
+                            }
+                        }
+                    }
+                }
+
+                let characteristic = target_char.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "Niimbot GATT characteristic not found",
+                    )
+                })?;
+                let notify_stream = characteristic.notify().await.map_err(io::Error::other)?;
+
+                let notify: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Vec<u8>> + Send>> =
+                    Box::pin(notify_stream);
+                Ok::<_, io::Error>((characteristic, notify))
+            }) {
+                Ok(res) => break res,
+                Err(err) => {
+                    attempt += 1;
+                    if attempt >= 5 {
+                        return Err(PrinterError::Io(err));
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+        };
+
+        Ok(Self {
+            runtime,
+            characteristic,
+            notify,
+            read_buf: Vec::new(),
+        })
     }
 }
 
 #[cfg(target_os = "linux")]
 impl Transport for BluetoothTransport {
     fn read(&mut self, length: usize) -> io::Result<Vec<u8>> {
-        let mut buf = vec![0_u8; length];
+        use tokio_stream::StreamExt;
+
+        if !self.read_buf.is_empty() {
+            let read_len = self.read_buf.len().min(length);
+            let result: Vec<u8> = self.read_buf.drain(..read_len).collect();
+            return Ok(result);
+        }
+
         let runtime = &self.runtime;
-        let stream = &mut self.stream;
-        let read = runtime.block_on(async { stream.read(&mut buf).await })?;
-        buf.truncate(read);
-        Ok(buf)
+        let notify = &mut self.notify;
+        let data = runtime
+            .block_on(async { notify.next().await })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "GATT notification stream ended",
+                )
+            })?;
+
+        if data.len() <= length {
+            Ok(data)
+        } else {
+            self.read_buf = data[length..].to_vec();
+            Ok(data[..length].to_vec())
+        }
     }
 
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         let runtime = &self.runtime;
-        let stream = &mut self.stream;
-        runtime.block_on(async { stream.write(data).await })
+        let characteristic = &self.characteristic;
+
+        let chunk_size = 20;
+        for chunk in data.chunks(chunk_size) {
+            runtime
+                .block_on(async {
+                    characteristic
+                        .write_ext(
+                            chunk,
+                            &CharacteristicWriteRequest {
+                                op_type: WriteOp::Command,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                })
+                .map_err(io::Error::other)?;
+        }
+
+        // Pace per row (packet), not per chunk!
+        std::thread::sleep(std::time::Duration::from_millis(15));
+
+        Ok(data.len())
     }
 }
 
@@ -182,6 +279,7 @@ pub enum RequestCode {
     SetDimension = 19,
     SetQuantity = 21,
     GetPrintStatus = 163,
+    PrinterStatusData = 165,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -229,6 +327,33 @@ impl<T: Transport> PrinterClient<T> {
         }
     }
 
+    /// Initializes connection with the printer by sending handshake packets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the printer does not acknowledge the
+    /// commands or the transport exchange fails.
+    pub fn init_connection(&mut self) -> Result<(), PrinterError> {
+        let init_packet = [0x03, 0x55, 0x55, 0xc1, 0x01, 0x01, 0xc1, 0xaa, 0xaa];
+        self.transport.write(&init_packet)?;
+        thread::sleep(Duration::from_millis(200));
+
+        let _ = self.send(&NiimbotPacket::new(
+            RequestCode::PrinterStatusData as u8,
+            vec![0x01],
+        ));
+        thread::sleep(Duration::from_millis(50));
+        let _ = self.send(&NiimbotPacket::new(RequestCode::GetInfo as u8, vec![0x08]));
+        thread::sleep(Duration::from_millis(50));
+        let _ = self.send(&NiimbotPacket::new(
+            RequestCode::Heartbeat as u8,
+            vec![0x04],
+        ));
+        thread::sleep(Duration::from_millis(50));
+
+        Ok(())
+    }
+
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
     }
@@ -244,12 +369,16 @@ impl<T: Transport> PrinterClient<T> {
             .map_err(|_| PrinterError::ImageTooLarge("image height exceeds printer limits"))?;
         let image_width = u16::try_from(image.width())
             .map_err(|_| PrinterError::ImageTooLarge("image width exceeds printer limits"))?;
+
+        // Initialize BLE connection (required for some devices like B1/D110 over BLE)
+        let _ = self.init_connection();
+
         let label_type = self.get_rfid()?.map_or(1, |rfid_info| rfid_info.label_type);
 
         with_command_context("set label density", self.set_label_density(density))?;
         with_command_context("set label type", self.set_label_type(label_type))?;
         with_command_context("start print", self.start_print())?;
-        with_command_context("allow print clear", self.allow_print_clear())?;
+
         with_command_context("start page print", self.start_page_print())?;
         with_command_context(
             "set dimension",
@@ -260,10 +389,24 @@ impl<T: Transport> PrinterClient<T> {
             self.send(&packet)?;
         }
         with_command_context("end page print", self.end_page_print())?;
-        thread::sleep(END_PRINT_SETTLE_DELAY);
-        while !with_command_context("end print", self.end_print())? {
-            thread::sleep(TRANSCEIVE_DELAY);
+
+        // Wait for the printer to finish printing the page so it doesn't abort
+        // the feed-out by receiving EndPrint too early.
+        let start_wait = std::time::Instant::now();
+        loop {
+            if start_wait.elapsed() > std::time::Duration::from_secs(10) {
+                return Err(PrinterError::Timeout);
+            }
+            if let Ok(status) = self.get_print_status()
+                && status.page >= 1
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
         }
+
+        thread::sleep(END_PRINT_SETTLE_DELAY);
+        with_command_context("end print", self.end_print())?;
         Ok(())
     }
 
@@ -284,6 +427,7 @@ impl<T: Transport> PrinterClient<T> {
         let packets = (0..height)
             .map(|y| {
                 let mut line_data = vec![0_u8; bytes_per_row];
+                let mut popcount = 0u16;
                 for x in 0..width {
                     let x_u32 = u32::try_from(x).map_err(|_| {
                         PrinterError::ImageTooLarge("image width exceeds u32 coordinates")
@@ -293,6 +437,7 @@ impl<T: Transport> PrinterClient<T> {
                         let byte_index = x / 8;
                         let bit_index = 7 - (x % 8);
                         line_data[byte_index] |= 1 << bit_index;
+                        popcount += 1;
                     }
                 }
 
@@ -302,7 +447,13 @@ impl<T: Transport> PrinterClient<T> {
                         .map_err(|_| PrinterError::ImageTooLarge("image height exceeds u16"))?
                         .to_be_bytes(),
                 );
-                payload.extend_from_slice(&[0, 0, 0, 1]);
+
+                // Header format: y(2 bytes, big-endian), 0, total(2 bytes, little-endian), run(1)
+                payload.push(0);
+                payload.push((popcount & 0xff) as u8);
+                payload.push((popcount >> 8) as u8);
+                payload.push(1);
+
                 payload.extend_from_slice(&line_data);
                 Ok(NiimbotPacket::new(0x85, payload))
             })
@@ -545,16 +696,21 @@ impl<T: Transport> PrinterClient<T> {
         })
     }
 
-    fn bool_command(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrinterError`] when the printer does not acknowledge the
+    /// command, the response times out, or the transport exchange fails.
+    pub fn bool_command(
         &mut self,
-        code: RequestCode,
-        payload: &[u8],
+        request: RequestCode,
+        data: &[u8],
         response_offset: u8,
     ) -> Result<bool, PrinterError> {
-        let packet = self
-            .transceive(code, payload, response_offset)?
-            .ok_or(PrinterError::Timeout)?;
-        Ok(packet.data().first().copied().unwrap_or_default() != 0)
+        match self.transceive(request, data, response_offset)? {
+            Some(packet) => Ok(packet.data().first().is_some_and(|&d| d != 0)),
+            None => Err(PrinterError::Timeout),
+        }
     }
 
     fn recv(&mut self) -> Result<Vec<NiimbotPacket>, PrinterError> {
@@ -774,7 +930,7 @@ mod tests {
 
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].packet_type(), 0x85);
-        assert_eq!(packets[0].data()[..6], [0, 0, 0, 0, 0, 1]);
+        assert_eq!(packets[0].data()[..6], [0, 0, 0, 4, 0, 1]);
         assert_eq!(packets[0].data()[6], 0x0f);
     }
 
@@ -787,6 +943,8 @@ mod tests {
         }
 
         fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            println!("Sending {} bytes", data.len());
             Ok(data.len())
         }
     }
