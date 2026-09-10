@@ -366,6 +366,7 @@ pub struct PrintStatus {
 pub struct PrinterClient<T: Transport> {
     transport: T,
     packetbuf: Vec<u8>,
+    extended_print_payloads: bool,
 }
 
 impl<T: Transport> PrinterClient<T> {
@@ -373,6 +374,7 @@ impl<T: Transport> PrinterClient<T> {
         Self {
             transport,
             packetbuf: Vec::new(),
+            extended_print_payloads: false,
         }
     }
 
@@ -383,6 +385,7 @@ impl<T: Transport> PrinterClient<T> {
     /// Returns [`PrinterError`] when the printer does not acknowledge the
     /// commands or the transport exchange fails.
     pub fn init_connection(&mut self) -> Result<(), PrinterError> {
+        self.extended_print_payloads = false;
         let init_packet = [0x03, 0x55, 0x55, 0xc1, 0x01, 0x01, 0xc1, 0xaa, 0xaa];
         self.transport.write(&init_packet)?;
         thread::sleep(Duration::from_millis(200));
@@ -426,22 +429,37 @@ impl<T: Transport> PrinterClient<T> {
 
         // Initialize BLE connection (required for some devices like B1/D110 over BLE)
         if self.transport.requires_ble_handshake() {
-            let _ = self.init_connection();
+            self.init_connection()?;
         }
 
         let label_type = self.get_rfid()?.map_or(1, |rfid_info| rfid_info.label_type);
 
         with_command_context("set label density", self.set_label_density(density))?;
         with_command_context("set label type", self.set_label_type(label_type))?;
-        with_command_context("start print", self.start_print())?;
+        let start = if self.extended_print_payloads {
+            let mut payload = [0; 9];
+            payload[..2].copy_from_slice(&quantity.to_be_bytes());
+            self.bool_command(RequestCode::StartPrint, &payload, 1)
+        } else {
+            self.start_print()
+        };
+        with_command_context("start print", start)?;
 
         let packets = self.encode_image(image)?;
 
         with_command_context("start page print", self.start_page_print())?;
-        with_command_context(
-            "set dimension",
-            self.set_dimension(image_height, image_width),
-        )?;
+        let dimension = if self.extended_print_payloads {
+            // D110_M acknowledges legacy dimensions but prints a blank first
+            // label after power-on. Include copies and the v4 optional fields.
+            let mut payload = [0; 13];
+            payload[..2].copy_from_slice(&image_height.to_be_bytes());
+            payload[2..4].copy_from_slice(&image_width.to_be_bytes());
+            payload[4..6].copy_from_slice(&quantity.to_be_bytes());
+            self.bool_command(RequestCode::SetDimension, &payload, 1)
+        } else {
+            self.set_dimension(image_height, image_width)
+        };
+        with_command_context("set dimension", dimension)?;
         with_command_context("set quantity", self.set_quantity(quantity))?;
 
         for packet in &packets {
@@ -783,6 +801,14 @@ impl<T: Transport> PrinterClient<T> {
             }
             let raw_packet = self.packetbuf.drain(..packet_len).collect::<Vec<_>>();
             let packet = NiimbotPacket::from_bytes(&raw_packet)?;
+            if packet.packet_type() == 0xb5 {
+                // The BLE handshake's status reply can arrive while another
+                // command is waiting. Capture it before response filtering.
+                // Wire versions 3.00 and 3.01 select the D110M_V4 print format.
+                // https://printers.niim.blue/interfacing/proto/#connect
+                self.extended_print_payloads =
+                    matches!(packet.data().get(11..13), Some([3, 0 | 1]));
+            }
             packets.push(packet);
         }
 
