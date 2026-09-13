@@ -807,10 +807,10 @@ impl<T: Transport> PrinterClient<T> {
     ///
     /// Returns [`PrinterError`] when the printer does not acknowledge the
     /// command or the transport exchange fails.
-    pub fn set_dimension(&mut self, width: u16, height: u16) -> Result<bool, PrinterError> {
+    pub fn set_dimension(&mut self, height: u16, width: u16) -> Result<bool, PrinterError> {
         let mut payload = Vec::with_capacity(4);
-        payload.extend_from_slice(&width.to_be_bytes());
         payload.extend_from_slice(&height.to_be_bytes());
+        payload.extend_from_slice(&width.to_be_bytes());
         self.bool_command(RequestCode::SetDimension, &payload, 1)
     }
 
